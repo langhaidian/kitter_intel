@@ -9,9 +9,17 @@ permissions:
   contents: write
 
 jobs:
-  macos-arm64:
-    name: macOS arm64
-    runs-on: macos-latest
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
@@ -30,18 +38,18 @@ jobs:
         shell: bash
         run: |
           crate_version="${GITHUB_REF_NAME#v}"
-          package_dir="target/release/kitter-cli-macos-arm64"
-          archive="target/release/Kitter-${crate_version}-cli-macos-arm64.tar.gz"
+          package_dir="target/release/kitter-cli-macos-${{ matrix.arch }}"
+          archive="target/release/Kitter-${crate_version}-cli-macos-${{ matrix.arch }}.tar.gz"
           mkdir -p "$package_dir"
           cp target/release/kitter LICENSE THIRD_PARTY_LICENSES.md "$package_dir/"
           tar -czf "$archive" -C "$package_dir" .
           tar -tzf "$archive"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-macos-arm64
+          name: release-macos-${{ matrix.arch }}
           path: |
-            target/release/Kitter-*-macos-arm64.dmg
-            target/release/Kitter-*-cli-macos-arm64.tar.gz
+            target/release/Kitter-*-macos-${{ matrix.arch }}.dmg
+            target/release/Kitter-*-cli-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   linux-x86-64:
@@ -150,7 +158,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [macos-arm64, linux-x86-64, windows-x86-64]
+    needs: [macos, linux-x86-64, windows-x86-64]
     runs-on: ubuntu-latest
 
     steps:
@@ -164,7 +172,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 6
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 8
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
