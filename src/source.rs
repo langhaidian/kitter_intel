@@ -660,6 +660,24 @@ fn tool_command(name: &str) -> Command {
     command
 }
 
+#[cfg(target_os = "macos")]
+fn find_tool_from_login_shell(name: &str, shell: &Path) -> Option<PathBuf> {
+    let output = Command::new(shell)
+        .args(["-ilc", "command -v -- \"$1\"", "kitter", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .rev()
+        .map(str::trim)
+        .map(PathBuf::from)
+        .find(|candidate| candidate.is_file())
+}
+
 fn find_tool(name: &str) -> Option<PathBuf> {
     let names = tool_names(name);
     let from_path = env::var_os("PATH").and_then(|paths| {
@@ -669,6 +687,16 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     });
     if from_path.is_some() {
         return from_path;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let shell = env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+        if let Some(executable) = find_tool_from_login_shell(name, &shell) {
+            return Some(executable);
+        }
     }
 
     let mut candidates = Vec::new();
@@ -737,6 +765,29 @@ fn tool_names(name: &str) -> Vec<String> {
     }
     #[cfg(not(windows))]
     vec![name.to_string()]
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn finds_tool_from_login_shell() {
+        let temp = TempDir::new().unwrap();
+        let tool = temp.path().join("npx");
+        fs::write(&tool, "").unwrap();
+
+        let shell = temp.path().join("shell");
+        fs::write(
+            &shell,
+            format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", tool.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(find_tool_from_login_shell("npx", &shell), Some(tool));
+    }
 }
 
 fn find_skill_dir(root: &Path) -> Result<PathBuf> {
