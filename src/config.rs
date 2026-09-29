@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -61,6 +61,10 @@ pub struct AppConfig {
     pub recent_projects: Vec<PathBuf>,
     #[serde(default)]
     pub project_activity: BTreeMap<PathBuf, u64>,
+    #[serde(default)]
+    pub collapsed_skill_groups: BTreeSet<String>,
+    #[serde(default)]
+    pub collapsed_skill_groups_initialized: bool,
 }
 
 impl Default for AppConfig {
@@ -71,6 +75,8 @@ impl Default for AppConfig {
             library_dir: app_data_dir().join("skills"),
             recent_projects: vec![],
             project_activity: BTreeMap::new(),
+            collapsed_skill_groups: BTreeSet::new(),
+            collapsed_skill_groups_initialized: false,
         }
     }
 }
@@ -251,5 +257,27 @@ mod tests {
         );
         let restored: AppConfig = serde_json::from_str(&older).unwrap();
         assert!(restored.project_activity.is_empty());
+        assert!(restored.collapsed_skill_groups.is_empty());
+        assert!(!restored.collapsed_skill_groups_initialized);
+    }
+
+    #[test]
+    fn collapsed_skill_groups_round_trip_and_default_when_missing() {
+        let mut config = AppConfig::default();
+        config.collapsed_skill_groups.insert("group-a".into());
+        config.collapsed_skill_groups_initialized = true;
+
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.collapsed_skill_groups,
+            config.collapsed_skill_groups
+        );
+        assert!(restored.collapsed_skill_groups_initialized);
+
+        let older = r#"{"language":"system","theme":"system","library_dir":"/tmp/skills"}"#;
+        let restored: AppConfig = serde_json::from_str(older).unwrap();
+        assert!(restored.collapsed_skill_groups.is_empty());
+        assert!(!restored.collapsed_skill_groups_initialized);
     }
 }

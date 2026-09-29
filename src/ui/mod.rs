@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -26,12 +26,18 @@ use gpui_component::{
 
 use crate::{
     InstallTarget, ProjectSkill, ProjectSkillInstallation, SkillGroup, SkillLibrary, SkillSummary,
-    adoption,
+    TriggerMode, adoption,
     config::{Language, Theme},
     effective_skills::{self, AgentContextEstimate, AgentKind},
     project, source,
     tags::{TagId, TagState, load_tag_states_from, save_tag_states_to},
 };
+
+actions!(kitter, [Quit]);
+
+fn quit(_: &Quit, cx: &mut App) {
+    cx.quit();
+}
 
 mod add_actions;
 mod add_flow;
@@ -42,6 +48,7 @@ mod effective_view;
 mod flows;
 mod install_flow;
 mod layout;
+mod messages;
 mod motion;
 mod organize_flows;
 mod overlay_actions;
@@ -57,6 +64,7 @@ mod state;
 mod tags_groups_actions;
 mod theme;
 
+use crate::text::counted;
 use effective_view::{EffectivePluginGroup, EffectiveSkillRow, same_file};
 use gpui_component::resizable::ResizableState;
 use skill_selection::SkillSelection;
@@ -251,6 +259,35 @@ impl Render for SkillDrag {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupDragScope {
+    Management,
+    List,
+}
+
+#[derive(Clone)]
+struct GroupDrag {
+    scope: GroupDragScope,
+    id: String,
+    name: String,
+    background: Rgba,
+    foreground: Rgba,
+}
+
+impl Render for GroupDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(RADIUS_CONTROL))
+            .bg(self.background)
+            .text_color(self.foreground)
+            .font_family(MONO)
+            .text_size(px(12.))
+            .child(self.name.clone())
+    }
+}
+
 #[derive(Clone)]
 struct TagDrag {
     scope: TagScope,
@@ -379,10 +416,17 @@ enum DeleteConfirmation {
     LibrarySkills {
         skills: Vec<(String, PathBuf)>,
     },
-    ProjectSkill {
+    ProjectSkills {
         project: PathBuf,
-        skill: crate::ProjectSkill,
+        skills: Vec<crate::ProjectSkill>,
+        batch: bool,
     },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ProjectSkillFilter {
+    Group(String),
+    Tag(TagId),
 }
 
 #[derive(Clone)]
@@ -456,6 +500,11 @@ impl KitterApp {
         };
         ComponentTheme::change(component_mode, Some(window), cx);
         let skills = library.list().unwrap_or_default();
+        let known_groups = library
+            .groups()
+            .into_iter()
+            .map(|group| group.id)
+            .collect::<HashSet<_>>();
         let selected = skills
             .first()
             .map(|skill| skill_storage_name(skill).to_string());
@@ -466,7 +515,7 @@ impl KitterApp {
         };
         let skill_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(if english {
-                "Search Skills"
+                "Search skills"
             } else {
                 "搜索技能"
             })
@@ -663,6 +712,9 @@ impl KitterApp {
                 let SelectEvent::Confirm(Some(kind)) = event else {
                     return;
                 };
+                if this.add_flow.task.is_some() {
+                    return;
+                }
                 this.add_flow.kind = *kind;
                 let english = this.uses_english();
                 let placeholder = match this.add_flow.kind {
@@ -698,11 +750,21 @@ impl KitterApp {
         )
         .detach();
         let (tags, project_tags) = load_tag_states_from(&data_dir);
+        let collapsed_groups = if library.config.collapsed_skill_groups_initialized {
+            library
+                .config
+                .collapsed_skill_groups
+                .iter()
+                .cloned()
+                .collect()
+        } else {
+            known_groups.clone()
+        };
         Self {
             model: AppModel {
                 library,
                 skills,
-                checking_updates: false,
+                update_check: None,
                 updating_skill: None,
             },
             shell: ShellState {
@@ -728,12 +790,16 @@ impl KitterApp {
                 content_snapshot: RefCell::new(None),
                 content_scroll: ScrollHandle::new(),
                 selectable_text_handles: RefCell::new(BTreeMap::new()),
-                collapsed_groups: HashSet::new(),
+                known_groups,
+                collapsed_groups,
                 collapsed_content_directories: HashSet::new(),
             },
             projects_view: ProjectsState {
                 open_project: None,
                 global_project_view: true,
+                batch_project: None,
+                batch_selected: HashSet::new(),
+                batch_filter: None,
                 project_skills_tab: ProjectSkillsTab::Skills,
                 selected_project_agent: None,
                 project_agents_expanded: false,
@@ -789,6 +855,7 @@ impl KitterApp {
                 return_to_assignment: None,
             },
             groups_flow: GroupsFlowState {
+                drop_target: None,
                 name_input: group_name_input,
                 edit: None,
                 delete_pending: None,
@@ -885,6 +952,17 @@ impl KitterApp {
         );
     }
 
+    fn persist_collapsed_groups(&mut self) {
+        self.model.library.config.collapsed_skill_groups =
+            self.skills_view.collapsed_groups.iter().cloned().collect();
+        self.model.library.config.collapsed_skill_groups_initialized = true;
+        let _ = self
+            .model
+            .library
+            .config
+            .save_to(self.model.library.data_dir());
+    }
+
     fn tag_filter_for(&self, scope: TagScope) -> Option<TagId> {
         match scope {
             TagScope::Skills => self.tags_flow.selected_skill_filter,
@@ -901,6 +979,26 @@ impl KitterApp {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.model.skills = self.model.library.list().unwrap_or_default();
+        let previous_collapsed_groups = self.skills_view.collapsed_groups.clone();
+        let current_groups = self
+            .model
+            .library
+            .groups()
+            .into_iter()
+            .map(|group| group.id)
+            .collect::<HashSet<_>>();
+        self.skills_view.collapsed_groups.extend(
+            current_groups
+                .difference(&self.skills_view.known_groups)
+                .cloned(),
+        );
+        self.skills_view
+            .collapsed_groups
+            .retain(|id| current_groups.contains(id));
+        self.skills_view.known_groups = current_groups;
+        if self.skills_view.collapsed_groups != previous_collapsed_groups {
+            self.persist_collapsed_groups();
+        }
         self.projects_view.scan_generation = self.projects_view.scan_generation.wrapping_add(1);
         self.projects_view.project_snapshots.borrow_mut().clear();
         self.projects_view
@@ -1117,7 +1215,7 @@ impl KitterApp {
             .model
             .library
             .read_file_by_storage(storage_name, &self.skills_view.selected_file)
-            .unwrap_or_else(|error| error.to_string());
+            .unwrap_or_else(|error| self.error_message(error));
         let snapshot = ContentSnapshot {
             skill: storage_name.to_string(),
             file: self.skills_view.selected_file.clone(),
@@ -1134,7 +1232,7 @@ impl KitterApp {
         self.skills_view.skill_search.update(cx, |input, cx| {
             input.set_placeholder(
                 if english {
-                    "Search Skills"
+                    "Search skills"
                 } else {
                     "搜索技能"
                 },
@@ -1155,6 +1253,31 @@ impl KitterApp {
         });
         self.tags_flow.name_input.update(cx, |input, cx| {
             input.set_placeholder(if english { "Tag name" } else { "标签名称" }, window, cx)
+        });
+        self.groups_flow.name_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                if english {
+                    "Group name"
+                } else {
+                    "分组名称"
+                },
+                window,
+                cx,
+            )
+        });
+        let placeholder = match self.add_flow.kind {
+            AddKind::Npx => self.tr(
+                "粘贴 skills.sh、GitHub 地址或 npx skills add 命令",
+                "Paste a skills.sh/GitHub URL or npx skills add command",
+            ),
+            AddKind::Claude => self.tr(
+                "插件名称或 claude plugin install 命令",
+                "Plugin name or claude plugin install command",
+            ),
+            AddKind::Local | AddKind::Existing => "",
+        };
+        self.add_flow.primary_input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx)
         });
         self.add_flow.source_select.update(cx, |select, cx| {
             select.set_items(
@@ -1302,22 +1425,58 @@ impl Render for KitterApp {
             );
         }
         if let Some(notice) = self.shell.notice.clone() {
-            root = root.child(
-                div()
-                    .absolute()
-                    .right(px(18.))
-                    .bottom(px(18.))
-                    .max_w(px(420.))
-                    .px(px(13.))
-                    .py(px(9.))
-                    .rounded(px(RADIUS_MENU))
-                    .border_1()
-                    .border_color(p.border_strong)
-                    .bg(p.surface)
-                    .shadow_md()
-                    .text_size(px(13.))
-                    .child(notice),
-            );
+            let progress = self.model.update_check.clone();
+            let mut card = div()
+                .id("app-notice")
+                .debug_selector(|| "app-notice".into())
+                .absolute()
+                .right(px(18.))
+                .bottom(px(18.))
+                .max_w(px(420.))
+                .when(progress.is_some(), |card| card.min_w(px(240.)))
+                .px(px(13.))
+                .py(px(9.))
+                .rounded(px(RADIUS_MENU))
+                .border_1()
+                .border_color(p.border_strong)
+                .bg(p.surface)
+                .shadow_md()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .text_size(px(13.))
+                .child(notice);
+            if let Some(progress) = progress {
+                if let Some(current) = progress.current.filter(|name| !name.is_empty()) {
+                    card = card.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.secondary)
+                            .truncate()
+                            .child(current),
+                    );
+                }
+                if progress.total > 0 {
+                    let ratio = (progress.scanned as f32 / progress.total as f32).clamp(0., 1.);
+                    card = card.child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.))
+                            .rounded(px(2.))
+                            .bg(p.raised)
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded(px(2.))
+                                    .bg(p.accent)
+                                    .w(relative(ratio)),
+                            ),
+                    );
+                }
+            }
+            root = root.child(card);
         }
         if let Some(body) = self.shell.dialog_body.clone() {
             let width = match body.read(cx).kind {
@@ -1420,6 +1579,61 @@ mod e2e_tests {
         });
         assert!(data_dir.join("registry.json").is_file());
         assert!(data_dir.join("skills/_kitter-builtin/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn collapsed_skill_groups_are_restored_from_config() {
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("kitter-data");
+        let (app, cx) = cx.add_window_view({
+            let data_dir = data_dir.clone();
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        let group_id = app.update(cx, |app, _| {
+            let id = app
+                .model
+                .library
+                .create_group("owner/repository")
+                .unwrap()
+                .id;
+            app.skills_view.collapsed_groups.insert(id.clone());
+            app.persist_collapsed_groups();
+            id
+        });
+
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let (app, cx) = cx.add_window_view({
+            let data_dir = data_dir.clone();
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        cx.read_entity(&app, |app, _| {
+            assert!(app.skills_view.collapsed_groups.contains(&group_id));
+            assert!(
+                app.model
+                    .library
+                    .config
+                    .collapsed_skill_groups
+                    .contains(&group_id)
+            );
+        });
+
+        app.update(cx, |app, _| {
+            app.skills_view.collapsed_groups.remove(&group_id);
+            app.persist_collapsed_groups();
+        });
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let (app, cx) = cx.add_window_view({
+            let data_dir = data_dir.clone();
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        cx.read_entity(&app, |app, _| {
+            assert!(!app.skills_view.collapsed_groups.contains(&group_id));
+            assert!(app.model.library.config.collapsed_skill_groups_initialized);
+        });
     }
 
     #[test]
@@ -1553,11 +1767,14 @@ mod e2e_tests {
         });
         cx.refresh().unwrap();
         cx.run_until_parked();
-        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_some());
+        let first_row = cx
+            .debug_bounds("project-skill-fixture-skill-001")
+            .expect("first virtual project row should be rendered");
         assert!(cx.debug_bounds("project-skill-fixture-skill-180").is_none());
         let scroll = cx
             .debug_bounds("project-skills-virtual-list")
             .expect("virtual project list should be rendered");
+        assert_eq!(first_row.size.width, scroll.size.width);
         // Avoid saturating GPUI's synthetic pixel delta at the exact maximum
         // offset; that test-only edge drops the virtual rows for the frame.
         cx.simulate_event(ScrollWheelEvent {
@@ -1568,6 +1785,203 @@ mod e2e_tests {
         cx.run_until_parked();
         cx.refresh().unwrap();
         assert!(cx.debug_bounds("project-skill-fixture-skill-180").is_some());
+    }
+
+    #[test]
+    fn groups_drag_in_both_views_and_keep_the_saved_order() {
+        use gpui::MouseButton;
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let (app, cx) = cx.add_window_view({
+            let data_dir = temp.path().join("data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        let (a, b) = app.update(cx, |app, cx| {
+            let a = app.model.library.create_group("A").unwrap().id;
+            let b = app.model.library.create_group("B").unwrap().id;
+            app.open_group_dialog(cx);
+            (a, b)
+        });
+        let a_row: &'static str = format!("sort-group-{a}").leak();
+        let b_row: &'static str = format!("sort-group-{b}").leak();
+        let a_handle: &'static str = format!("drag-group-{a}").leak();
+        for management in [true, false] {
+            if !management {
+                app.update(cx, |app, cx| app.close_dialog(cx));
+            }
+            cx.refresh().unwrap();
+            let row = cx.debug_bounds(a_row).unwrap();
+            cx.simulate_mouse_move(row.center(), None, Modifiers::none());
+            cx.refresh().unwrap();
+            let start = if management {
+                cx.debug_bounds(a_handle).unwrap().center()
+            } else {
+                assert!(
+                    cx.debug_bounds(a_handle).is_none(),
+                    "list must not have a drag handle or its spacing"
+                );
+                row.center()
+            };
+            if management {
+                let handle = cx.debug_bounds(a_handle).unwrap();
+                assert_eq!(handle.size.width, px(24.));
+                assert_eq!(handle.origin.x, row.origin.x);
+                assert_eq!(
+                    cx.debug_bounds(a_row).unwrap(),
+                    row,
+                    "hover must not shift the row"
+                );
+            }
+            let target = cx.debug_bounds(b_row).unwrap();
+            let end = point(
+                target.center().x,
+                target.center().y + if management { px(5.) } else { px(-5.) },
+            );
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(
+                start + point(px(5.), px(0.)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.refresh().unwrap();
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+            cx.refresh().unwrap();
+            assert_eq!(
+                cx.debug_bounds("group-drop-line-Management").is_some(),
+                management
+            );
+            assert_eq!(
+                cx.debug_bounds("group-drop-line-List").is_some(),
+                !management
+            );
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            cx.refresh().unwrap();
+            app.update(cx, |app, _| {
+                let ids = app
+                    .model
+                    .library
+                    .groups()
+                    .into_iter()
+                    .map(|group| group.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ids,
+                    if management {
+                        vec![b.clone(), a.clone()]
+                    } else {
+                        vec![a.clone(), b.clone()]
+                    }
+                );
+                assert!(app.skills_view.collapsed_groups.is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn creating_group_inside_add_keeps_selection_and_dialog() {
+        use super::{DialogKind, GroupEdit};
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let (app, cx) = cx.add_window_view({
+            let data_dir = temp.path().join("data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_add_dialog(window, cx);
+            app.add_flow.selected.extend(["one".into(), "two".into()]);
+            app.notify_dialog(cx);
+        });
+        cx.refresh().unwrap();
+        let selector = cx.debug_bounds("add-group-control").unwrap();
+        cx.simulate_click(
+            point(selector.center().x, selector.bottom() - px(12.)),
+            Modifiers::none(),
+        );
+        cx.refresh().unwrap();
+        let create = cx.debug_bounds("add-group-create").unwrap();
+        cx.simulate_click(create.center(), Modifiers::none());
+        cx.refresh().unwrap();
+        cx.simulate_input("Team");
+        cx.simulate_keystrokes("enter");
+        app.update_in(cx, |app, window, cx| {
+            assert!(matches!(
+                app.shell.dialog_body.as_ref().unwrap().read(cx).kind,
+                DialogKind::Add
+            ));
+            assert_eq!(app.add_flow.group_name.as_deref(), Some("Team"));
+            assert_eq!(app.add_flow.selected.len(), 2);
+            assert_eq!(app.model.library.groups().len(), 1);
+            app.start_group_edit(GroupEdit::Create, window, cx);
+            app.groups_flow
+                .name_input
+                .update(cx, |input, cx| input.set_value("Team", window, cx));
+            app.commit_group_edit(cx);
+            assert!(app.groups_flow.edit.is_some());
+            assert!(app.tags_flow.error.is_some());
+            assert_eq!(app.model.library.groups().len(), 1);
+        });
+    }
+
+    #[test]
+    fn busy_add_dialog_blocks_changes_and_recovers_when_idle() {
+        use super::{AddTask, Language};
+        use gpui::Focusable;
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let (app, cx) = cx.add_window_view({
+            let data_dir = temp.path().join("data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.set_language(Language::En, window, cx);
+            app.open_add_dialog(window, cx);
+            app.add_flow.primary_input.update(cx, |input, cx| {
+                input.set_value("https://github.com/mattpocock/skills", window, cx);
+                input.focus_handle(cx).focus(window, cx);
+            });
+            app.add_flow.selected.extend(["one".into(), "two".into()]);
+            app.add_flow.task = Some(AddTask::Scanning);
+            app.notify_dialog(cx);
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("scan-progress").is_some());
+        cx.simulate_keystrokes("x");
+        for selector in ["close-add-modal", "cancel-add"] {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(bounds.center(), Modifiers::none());
+        }
+        app.update_in(cx, |app, window, cx| {
+            assert_eq!(
+                app.add_flow.primary_input.read(cx).value().as_ref(),
+                "https://github.com/mattpocock/skills"
+            );
+            assert!(
+                !app.add_flow
+                    .primary_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            app.set_add_kind(AddKind::Local, window, cx);
+            assert!(app.add_flow.kind == AddKind::Npx);
+            app.close_dialog(cx);
+            assert!(app.shell.dialog_body.is_some());
+            app.add_flow.task = Some(AddTask::Importing);
+            app.notify_dialog(cx);
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("scan-progress").is_none());
+        app.update(cx, |app, cx| {
+            app.add_flow.task = None;
+            app.notify_dialog(cx);
+        });
+        cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("close-add-modal").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| assert!(app.shell.dialog_body.is_none()));
     }
 
     #[test]
@@ -1618,7 +2032,7 @@ mod e2e_tests {
 
         let candidate = cx
             .debug_bounds("scan-skill-0")
-            .expect("scanned Skill row should be rendered");
+            .expect("scanned skill row should be rendered");
         cx.simulate_click(candidate.center(), Modifiers::none());
         cx.run_until_parked();
         let confirm = cx
@@ -1636,6 +2050,69 @@ mod e2e_tests {
             assert!(app.shell.dialog_body.is_none());
         });
         assert!(data_dir.join("skills/fixture-skill/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn check_updates_shows_scan_progress_notice() {
+        use super::Language;
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("kitter-data");
+        let source = temp.path().join("skills");
+        for name in ["alpha", "beta"] {
+            fs::create_dir_all(source.join(name)).unwrap();
+            fs::write(
+                source.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Fixture\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let (app, cx) = cx.add_window_view({
+            let data_dir = data_dir.clone();
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.set_language(Language::ZhCn, window, cx);
+            crate::source::scan_local(&source)
+                .unwrap()
+                .import_selected(
+                    &mut app.model.library,
+                    &HashSet::from(["alpha".into(), "beta".into()]),
+                    None,
+                )
+                .unwrap();
+            app.refresh(cx);
+            app.check_all_updates(cx);
+            let progress = app
+                .model
+                .update_check
+                .as_ref()
+                .expect("check should start immediately");
+            assert_eq!(progress.total, 2);
+            assert_eq!(progress.scanned, 0);
+            assert!(
+                app.shell
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("正在检查更新"))
+            );
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("app-notice").is_some());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        app.update(cx, |app, _| {
+            assert!(app.model.update_check.is_none());
+            assert_eq!(app.shell.notice.as_deref(), Some("所有技能都是最新版本"));
+        });
+        assert!(cx.debug_bounds("app-notice").is_some());
     }
 }
 
@@ -1672,6 +2149,8 @@ pub fn run() {
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
+            cx.on_action(quit);
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.set_app_identity("dev.kitter.app", "Kitter");
             gpui_component::init(cx);
             crate::assets::register_fonts(cx).expect("failed to register fonts");

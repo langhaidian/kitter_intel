@@ -1,6 +1,31 @@
 use super::*;
 
 impl KitterApp {
+    pub(super) fn set_skill_trigger_mode(
+        &mut self,
+        storage_name: &str,
+        mode: TriggerMode,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .model
+            .library
+            .set_trigger_mode_by_storage(storage_name, mode)
+        {
+            Ok(()) => {
+                self.refresh(cx);
+                self.show_notice(self.tr("触发时机已更新", "Trigger timing updated"), cx);
+            }
+            Err(error) => {
+                eprintln!("Kitter: {error:#}");
+                self.show_notice(
+                    self.tr("无法更改触发时机", "Could not change trigger timing"),
+                    cx,
+                );
+            }
+        }
+    }
+
     pub(super) fn selected_skill(&self) -> Option<&SkillSummary> {
         let storage_name = self.skills_view.selection.primary()?;
         self.model
@@ -83,14 +108,21 @@ impl KitterApp {
         &mut self,
         storage_name: String,
         modifiers: Modifiers,
+        visible_order: &[String],
         cx: &mut Context<Self>,
     ) {
-        if modifiers.secondary() {
-            self.toggle_skill_selection(storage_name, cx);
+        let primary = if modifiers.shift {
+            self.skills_view
+                .selection
+                .select_range(storage_name, visible_order)
+        } else if modifiers.secondary() {
+            self.skills_view
+                .selection
+                .toggle(storage_name, visible_order)
         } else {
-            let primary = self.skills_view.selection.select_one(storage_name);
-            self.set_detail_selection(primary);
-        }
+            self.skills_view.selection.select_one(storage_name)
+        };
+        self.set_detail_selection(primary);
         cx.notify();
     }
 

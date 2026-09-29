@@ -20,23 +20,21 @@ pub struct ScannedSkill {
 }
 
 enum ScanOrigin {
-    Npx {
-        repository: String,
-        workspace: PathBuf,
-    },
-    Claude {
-        plugin: String,
-    },
-    Local {
-        root: PathBuf,
-        label: String,
-    },
+    Npx { repository: String },
+    Claude { plugin: String },
+    Local { root: PathBuf, label: String },
 }
 
 pub struct SkillScan {
     origin: ScanOrigin,
     skills: Vec<ScannedSkill>,
     _temp: Option<TempDir>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub added: usize,
+    pub skipped: usize,
 }
 
 impl SkillScan {
@@ -89,49 +87,70 @@ impl SkillScan {
         library: &mut SkillLibrary,
         selected: &HashSet<String>,
         group_name: Option<&str>,
-    ) -> Result<usize> {
+    ) -> Result<ImportSummary> {
         if selected.is_empty() {
             bail!("请至少选择一个技能");
         }
         let SkillScan {
             origin,
             skills,
-            _temp: _,
+            _temp: scan_temp,
         } = self;
         let discovered_skills = skills
             .iter()
             .map(|skill| skill.name.clone())
             .collect::<Vec<_>>();
-        if let ScanOrigin::Npx {
-            repository,
-            workspace,
-        } = &origin
-        {
-            // Discover from a clean temporary workspace, then keep one
-            // persistent upstream-managed workspace for the selected source.
-            // This prevents removed upstream skills from reappearing in a
-            // later scan just because they are still in the cache.
-            npx_add(workspace, repository, "*")?;
-        }
+        // The scan already downloaded a complete snapshot. Import from that
+        // snapshot only; update workspaces are prepared lazily by update flows.
+        let mut scan_hashes = if matches!(origin, ScanOrigin::Npx { .. }) {
+            npx_lock_hashes(
+                scan_temp
+                    .as_ref()
+                    .context("Npx 扫描结果不可用，请重新扫描")?
+                    .path(),
+            )?
+        } else {
+            HashMap::new()
+        };
         let mut added_skills = Vec::new();
-        let group_id = group_name
+        let mut skipped = 0;
+        let group_name = group_name
             .filter(|name| !name.trim().is_empty())
-            .map(|name| library.ensure_group(name))
-            .transpose()?;
+            .map(str::to_string);
+        let mut group_id = None;
         for skill in skills
             .into_iter()
             .filter(|skill| selected.contains(&skill.name))
         {
+            let identity = match &origin {
+                ScanOrigin::Npx { repository, .. } => SkillOrigin::Npx {
+                    repository: repository.clone(),
+                    skill: skill.name.clone(),
+                    source_hash: None,
+                }
+                .identity_key(&skill.name),
+                ScanOrigin::Claude { plugin } => SkillOrigin::ClaudeMarketplace {
+                    plugin: plugin.clone(),
+                    skill: skill.name.clone(),
+                }
+                .identity_key(&skill.name),
+                ScanOrigin::Local { root, .. } => SkillOrigin::Local {
+                    path: skill.path.clone(),
+                    source_root: Some(root.clone()),
+                }
+                .identity_key(&skill.name),
+            };
+            if library.contains_identity(&identity) {
+                skipped += 1;
+                continue;
+            }
             let (source_path, skill_origin) = match &origin {
-                ScanOrigin::Npx {
-                    repository,
-                    workspace,
-                } => (
-                    npx_skill_path(workspace, &skill.name),
+                ScanOrigin::Npx { repository } => (
+                    skill.path.clone(),
                     SkillOrigin::Npx {
                         repository: repository.clone(),
                         skill: skill.name.clone(),
-                        source_hash: npx_lock_hash(workspace, &skill.name)?,
+                        source_hash: scan_hashes.remove(&skill.name),
                     },
                 ),
                 ScanOrigin::Claude { plugin } => (
@@ -149,6 +168,11 @@ impl SkillScan {
                     },
                 ),
             };
+            if group_id.is_none()
+                && let Some(group_name) = group_name.as_deref()
+            {
+                group_id = Some(library.ensure_group(group_name)?);
+            }
             let name = skill.name.clone();
             library.import(
                 &source_path,
@@ -169,9 +193,9 @@ impl SkillScan {
             ScanOrigin::Claude { plugin } => crate::SkillSource::ClaudeMarketplace { plugin },
             ScanOrigin::Local { root, .. } => crate::SkillSource::Local { path: root },
         };
-        let count = added_skills.len();
+        let added = added_skills.len();
         library.record_source(source, discovered_skills, added_skills)?;
-        Ok(count)
+        Ok(ImportSummary { added, skipped })
     }
 }
 
@@ -234,7 +258,6 @@ pub fn scan_local(root: &Path) -> Result<SkillScan> {
 
 pub fn scan_npx(input: &str) -> Result<SkillScan> {
     let repository = normalize_npx_source(input)?;
-    let workspace = npx_workspace(&repository);
     let temp = TempDir::new()?;
     npx_add(temp.path(), &repository, "*")?;
     let root = temp.path().join(".agents/skills");
@@ -264,10 +287,7 @@ pub fn scan_npx(input: &str) -> Result<SkillScan> {
     }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(SkillScan {
-        origin: ScanOrigin::Npx {
-            repository,
-            workspace,
-        },
+        origin: ScanOrigin::Npx { repository },
         skills,
         _temp: Some(temp),
     })
@@ -404,7 +424,21 @@ fn update_record(library: &mut SkillLibrary, mut record: SkillRecord) -> Result<
     library.replace_by_storage(&source, storage_name, record)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateCheckProgress {
+    pub scanned: usize,
+    pub total: usize,
+    pub current: Option<String>,
+}
+
 pub fn check_updates(library: &mut SkillLibrary) -> Result<usize> {
+    check_updates_with_progress(library, |_| {})
+}
+
+pub fn check_updates_with_progress(
+    library: &mut SkillLibrary,
+    mut on_progress: impl FnMut(UpdateCheckProgress),
+) -> Result<usize> {
     let records = library
         .list()?
         .into_iter()
@@ -414,32 +448,48 @@ pub fn check_updates(library: &mut SkillLibrary) -> Result<usize> {
         })
         .map(|skill| skill.record)
         .collect::<Vec<_>>();
+    let total = records.len();
+    let mut scanned = 0usize;
+    on_progress(UpdateCheckProgress {
+        scanned,
+        total,
+        current: None,
+    });
 
     // The upstream CLI owns Npx version detection. It updates the persistent
     // source workspace, then we compare its lock hash with the hash recorded
     // when the Kitter copy was last installed. This avoids reimplementing
     // repository/tree comparison here while preserving the UI's pending-update
     // state until the user chooses to install the update into the library.
-    let mut npx_sources = BTreeMap::<String, Vec<String>>::new();
-    for record in &records {
-        if let SkillOrigin::Npx {
-            repository, skill, ..
-        } = &record.origin
-        {
-            npx_sources
-                .entry(repository.clone())
-                .or_default()
-                .push(skill.clone());
+    let mut npx_sources = BTreeMap::<String, Vec<SkillRecord>>::new();
+    let mut other_records = Vec::new();
+    for record in records {
+        match &record.origin {
+            SkillOrigin::Npx { repository, .. } => {
+                npx_sources
+                    .entry(repository.clone())
+                    .or_default()
+                    .push(record);
+            }
+            _ => other_records.push(record),
         }
     }
 
-    let mut npx_hashes = HashMap::<String, HashMap<String, String>>::new();
+    let mut count = 0;
     let mut failures = Vec::new();
     for (repository, skills) in npx_sources {
+        on_progress(UpdateCheckProgress {
+            scanned,
+            total,
+            current: Some(repository.clone()),
+        });
         let result = (|| -> Result<HashMap<String, String>> {
             let workspace = npx_workspace(&repository);
-            for skill in skills {
-                ensure_npx_skill(&workspace, &repository, &skill)?;
+            for record in &skills {
+                let SkillOrigin::Npx { skill, .. } = &record.origin else {
+                    continue;
+                };
+                ensure_npx_skill(&workspace, &repository, skill)?;
             }
             // `skills update` performs the upstream check and refreshes only
             // the source workspace. The Kitter library remains unchanged
@@ -447,35 +497,53 @@ pub fn check_updates(library: &mut SkillLibrary) -> Result<usize> {
             npx_update(&workspace, None)?;
             npx_lock_hashes(&workspace)
         })();
-        match result {
-            Ok(hashes) => {
-                npx_hashes.insert(repository, hashes);
+        let hashes = match result {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                failures.push(format!("Npx 来源检查失败：{error:#}"));
+                HashMap::new()
             }
-            Err(error) => failures.push(format!("Npx 来源检查失败：{error:#}")),
+        };
+        for record in skills {
+            let available = match &record.origin {
+                SkillOrigin::Npx {
+                    skill, source_hash, ..
+                } => hashes
+                    .get(skill)
+                    .is_some_and(|current| source_hash.as_deref() != Some(current.as_str())),
+                _ => false,
+            };
+            library.set_update_available_by_storage(&record.storage_name, available)?;
+            count += usize::from(available);
+            scanned += 1;
+            on_progress(UpdateCheckProgress {
+                scanned,
+                total,
+                current: Some(record.name.clone()),
+            });
         }
     }
 
-    let mut count = 0;
-    for record in records {
-        let result = match &record.origin {
-            SkillOrigin::Npx {
-                repository,
-                skill,
-                source_hash,
-            } => Ok(npx_hashes
-                .get(repository)
-                .and_then(|hashes| hashes.get(skill))
-                .is_some_and(|current| source_hash.as_deref() != Some(current.as_str()))),
-            _ => check_one(library, &record),
-        };
-        match result {
+    for record in other_records {
+        on_progress(UpdateCheckProgress {
+            scanned,
+            total,
+            current: Some(record.name.clone()),
+        });
+        match check_one(library, &record) {
             Ok(available) => {
                 library.set_update_available_by_storage(&record.storage_name, available)?;
                 count += usize::from(available);
             }
             Err(error) => failures.push(format!("{}: {error:#}", record.name)),
         }
+        scanned += 1;
     }
+    on_progress(UpdateCheckProgress {
+        scanned,
+        total,
+        current: None,
+    });
     if !failures.is_empty() {
         bail!("部分技能检查失败：{}", failures.join("；"));
     }
@@ -502,10 +570,15 @@ fn check_one(library: &SkillLibrary, record: &SkillRecord) -> Result<bool> {
         SkillOrigin::Unknown => return Ok(false),
         SkillOrigin::Npx { .. } => return Ok(false),
     };
-    Ok(!same_tree(
-        &source,
-        &library.skill_path_by_storage(&record.storage_name)?,
-    )?)
+    let library_path = library.skill_path_by_storage(&record.storage_name)?;
+    if let Some(original) = library.trigger_source_by_storage(&record.storage_name) {
+        let comparison = temp.path().join("library-source");
+        crate::library::copy_tree(&library_path, &comparison)?;
+        original.write(&comparison)?;
+        Ok(!same_tree(&source, &comparison)?)
+    } else {
+        Ok(!same_tree(&source, &library_path)?)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -768,13 +841,13 @@ fn tool_names(name: &str) -> Vec<String> {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+mod login_shell_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn finds_tool_from_login_shell() {
-        let temp = TempDir::new().unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let tool = temp.path().join("npx");
         fs::write(&tool, "").unwrap();
 
@@ -789,6 +862,7 @@ mod tests {
         assert_eq!(find_tool_from_login_shell("npx", &shell), Some(tool));
     }
 }
+
 
 fn find_skill_dir(root: &Path) -> Result<PathBuf> {
     if root.join("SKILL.md").is_file() {
@@ -842,4 +916,287 @@ fn find_claude_skills(plugin: &str) -> Result<Vec<PathBuf>> {
         bail!("Claude 插件中没有找到技能");
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_skill(path: &Path, name: &str) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(
+            path.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: fixture\n---\n"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npx_scan_is_the_only_download_even_after_partial_import_and_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let snapshot = temp.path().join("snapshot");
+        for index in 1..=33 {
+            let name = format!("skill-{index:02}");
+            write_skill(&snapshot.join(".agents/skills").join(&name), &name);
+        }
+        let entries = (1..=33)
+            .map(|index| {
+                (
+                    format!("skill-{index:02}"),
+                    serde_json::json!({"computedHash": format!("hash-{index}")}),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        fs::write(
+            snapshot.join("skills-lock.json"),
+            serde_json::to_vec(&serde_json::json!({"skills": entries})).unwrap(),
+        )
+        .unwrap();
+        let stub = bin.join("npx");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+printf 'call\n' >> "$KITTER_IMPORT_FIXTURE/calls"
+[ "$6" = '*' ] || exit 91
+/bin/cp -R "$KITTER_IMPORT_FIXTURE/snapshot/." .
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        // Run in a child so PATH and the application data directory cannot
+        // interfere with parallel tests or the user's installation.
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "source::tests::npx_import_fixture_child",
+                "--nocapture",
+            ])
+            .env("KITTER_IMPORT_FIXTURE", temp.path())
+            .env("KITTER_HOME", temp.path().join("data"))
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "exactly one download per scan, none during import"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npx_import_fixture_child() {
+        let Some(root) = env::var_os("KITTER_IMPORT_FIXTURE").map(PathBuf::from) else {
+            return;
+        };
+        let repository = "https://github.com/fixture/import-test";
+        let mut scan = scan_npx(repository).unwrap();
+        let selected = scan
+            .skills()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<HashSet<_>>();
+        // A failed eighteenth item leaves the same 17 persisted skills as an
+        // interrupted import, without killing a worker or touching real data.
+        fs::remove_dir_all(&scan.skills[17].path).unwrap();
+        let mut library = SkillLibrary::open_in(root.join("data")).unwrap();
+        assert!(
+            scan.import_selected(&mut library, &selected, Some("fixture"))
+                .is_err()
+        );
+        assert_eq!(library.list().unwrap().len(), 18); // 17 imported + built-in.
+        let group = library
+            .groups()
+            .into_iter()
+            .find(|g| g.name == "fixture")
+            .unwrap();
+        assert_eq!(library.delete_group(&group.id, true).unwrap().len(), 17);
+        assert_eq!(library.list().unwrap().len(), 1); // Built-in skill only.
+        scan = scan_npx(repository).unwrap();
+        let started = std::time::Instant::now();
+        let summary = scan
+            .import_selected(&mut library, &selected, Some("fixture"))
+            .unwrap();
+        eprintln!("33-skill local import: {:?}", started.elapsed());
+        assert_eq!(
+            summary,
+            ImportSummary {
+                added: 33,
+                skipped: 0
+            }
+        );
+        assert!(
+            matches!(library.record("skill-18").unwrap().origin, SkillOrigin::Npx { source_hash: Some(hash), .. } if hash == "hash-18")
+        );
+        assert!(!root.join("data/npx-sources").exists());
+    }
+
+    #[test]
+    fn local_batch_skips_existing_identity_and_imports_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        write_skill(&source_root.join("alpha"), "alpha");
+        let mut library = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+
+        let first = scan_local(&source_root).unwrap();
+        let first_selected = HashSet::from(["alpha".to_string()]);
+        assert_eq!(
+            first
+                .import_selected(&mut library, &first_selected, None)
+                .unwrap(),
+            ImportSummary {
+                added: 1,
+                skipped: 0,
+            }
+        );
+
+        write_skill(&source_root.join("beta"), "beta");
+        let second = scan_local(&source_root).unwrap();
+        let selected = HashSet::from(["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            second
+                .import_selected(&mut library, &selected, None)
+                .unwrap(),
+            ImportSummary {
+                added: 1,
+                skipped: 1,
+            }
+        );
+
+        let names = library
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|skill| skill.record.name)
+            .collect::<HashSet<_>>();
+        assert!(names.contains("alpha"));
+        assert!(names.contains("beta"));
+    }
+
+    #[test]
+    fn skipped_batch_does_not_create_an_empty_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        write_skill(&source_root.join("alpha"), "alpha");
+        let mut library = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        let selected = HashSet::from(["alpha".to_string()]);
+
+        scan_local(&source_root)
+            .unwrap()
+            .import_selected(&mut library, &selected, None)
+            .unwrap();
+        let summary = scan_local(&source_root)
+            .unwrap()
+            .import_selected(&mut library, &selected, Some("owner/repository"))
+            .unwrap();
+
+        assert_eq!(
+            summary,
+            ImportSummary {
+                added: 0,
+                skipped: 1,
+            }
+        );
+        assert!(library.groups().is_empty());
+    }
+
+    #[test]
+    fn check_updates_reports_per_skill_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        write_skill(&source_root.join("alpha"), "alpha");
+        write_skill(&source_root.join("beta"), "beta");
+        let mut library = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        scan_local(&source_root)
+            .unwrap()
+            .import_selected(
+                &mut library,
+                &HashSet::from(["alpha".to_string(), "beta".to_string()]),
+                None,
+            )
+            .unwrap();
+
+        let mut reports = Vec::new();
+        let count = check_updates_with_progress(&mut library, |progress| {
+            reports.push(progress);
+        })
+        .unwrap();
+
+        assert_eq!(count, 0);
+        assert!(
+            reports
+                .iter()
+                .any(|progress| progress.total == 2 && progress.scanned == 0)
+        );
+        assert_eq!(reports.last().map(|progress| progress.scanned), Some(2));
+        assert!(
+            reports
+                .windows(2)
+                .all(|window| window[0].scanned <= window[1].scanned)
+        );
+        let names = reports
+            .iter()
+            .filter_map(|progress| progress.current.clone())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("alpha"));
+        assert!(names.contains("beta"));
+    }
+
+    #[test]
+    fn npx_import_preserves_the_scan_content_and_lock_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let scan_temp = tempfile::tempdir().unwrap();
+        let scanned_skill = scan_temp.path().join(".agents/skills/alpha");
+        fs::create_dir_all(scan_temp.path().join(".agents")).unwrap();
+        fs::create_dir_all(&scanned_skill).unwrap();
+        fs::write(
+            scanned_skill.join("SKILL.md"),
+            "---\nname: alpha\ndescription: fresh\n---\nfresh scan\n",
+        )
+        .unwrap();
+        fs::write(
+            scan_temp.path().join(".agents/.skill-lock.json"),
+            r#"{"skills":{"alpha":{"skillFolderHash":"fresh-hash"}}}"#,
+        )
+        .unwrap();
+
+        let scan = SkillScan {
+            origin: ScanOrigin::Npx {
+                repository: "owner/repository".into(),
+            },
+            skills: vec![ScannedSkill {
+                name: "alpha".into(),
+                description: "fresh".into(),
+                path: scanned_skill,
+            }],
+            _temp: Some(scan_temp),
+        };
+        let mut library = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        scan.import_selected(&mut library, &HashSet::from(["alpha".to_string()]), None)
+            .unwrap();
+
+        let content =
+            fs::read_to_string(library.skill_path("alpha").unwrap().join("SKILL.md")).unwrap();
+        assert!(content.contains("fresh scan"));
+        assert!(matches!(
+            library.record("alpha").unwrap().origin,
+            SkillOrigin::Npx {
+                source_hash: Some(hash),
+                ..
+            } if hash == "fresh-hash"
+        ));
+    }
 }

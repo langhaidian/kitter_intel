@@ -25,10 +25,12 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-latest
+            os: macos-latest
           - arch: x86_64
-            runner: macos-15-intel
-    runs-on: ${{ matrix.runner }}
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    env:
+      KITTER_ARCH: ${{ matrix.arch }}
 
     steps:
       - uses: actions/checkout@v4
@@ -43,14 +45,21 @@ jobs:
         run: |
           crate_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
           test "$RELEASE_TAG" = "v${crate_version}"
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "$KITTER_ARCH"
       - name: Build and verify desktop package
         run: just release
+      - name: Verify binary architectures
+        run: |
+          lipo target/release/Kitter.app/Contents/MacOS/Kitter -verify_arch "$KITTER_ARCH"
+          lipo target/release/kitter -verify_arch "$KITTER_ARCH"
+          target/release/kitter --help
       - name: Package standalone CLI
         shell: bash
         run: |
           crate_version="${RELEASE_TAG#v}"
-          package_dir="target/release/kitter-cli-macos-${{ matrix.arch }}"
-          archive="target/release/Kitter-${crate_version}-cli-macos-${{ matrix.arch }}.tar.gz"
+          package_dir="target/release/kitter-cli-macos-${KITTER_ARCH}"
+          archive="target/release/Kitter-${crate_version}-cli-macos-${KITTER_ARCH}.tar.gz"
           mkdir -p "$package_dir"
           cp target/release/kitter LICENSE THIRD_PARTY_LICENSES.md "$package_dir/"
           tar -czf "$archive" -C "$package_dir" .

@@ -2,6 +2,10 @@ use super::*;
 
 impl KitterApp {
     pub(super) fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.add_flow.task.is_some() {
+            return;
+        }
+        self.groups_flow.edit = None;
         self.add_flow.task = None;
         self.add_flow.scan = None;
         self.add_flow.adoption_scan = None;
@@ -41,6 +45,9 @@ impl KitterApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.add_flow.task.is_some() {
+            return;
+        }
         if let Some(cancel) = self.add_flow.adoption_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -69,6 +76,8 @@ impl KitterApp {
             input.set_value("", window, cx);
             input.set_placeholder(placeholder, window, cx);
         });
+        self.groups_flow.edit = None;
+        self.tags_flow.error = None;
         self.add_flow.scan = None;
         self.add_flow.selected.clear();
         self.add_flow.error = None;
@@ -92,38 +101,86 @@ impl KitterApp {
     }
 
     pub(super) fn check_all_updates(&mut self, cx: &mut Context<Self>) {
-        if self.model.checking_updates {
+        if self.model.update_check.is_some() {
             return;
         }
-        self.model.checking_updates = true;
+        let total = self
+            .model
+            .skills
+            .iter()
+            .filter(|skill| {
+                !skill.record.origin.is_builtin()
+                    && !self
+                        .model
+                        .library
+                        .is_linked_source(skill_storage_name(skill))
+            })
+            .count();
+        self.model.update_check = Some(source::UpdateCheckProgress {
+            scanned: 0,
+            total,
+            current: None,
+        });
+        self.show_sticky_notice(self.update_check_notice(), cx);
         let data_dir = self.model.library.data_dir().to_path_buf();
+        let progress = Arc::new(Mutex::new(source::UpdateCheckProgress {
+            scanned: 0,
+            total,
+            current: None,
+        }));
+        let worker_progress = progress.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = done.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
+            let worker = cx.background_executor().spawn(async move {
+                let result = (|| {
                     let mut library = SkillLibrary::open_in(data_dir)?;
-                    let count = source::check_updates(&mut library)?;
+                    let count = source::check_updates_with_progress(&mut library, |snapshot| {
+                        *worker_progress
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+                    })?;
                     Ok::<_, anyhow::Error>((library, count))
-                })
-                .await;
+                })();
+                worker_done.store(true, Ordering::Release);
+                result
+            });
+            while !done.load(Ordering::Acquire) {
+                let snapshot = progress
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let _ = this.update(cx, |this, cx| {
+                    if this.model.update_check.is_some() {
+                        this.set_update_check_progress(snapshot, cx);
+                    }
+                });
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+            }
+            let result = worker.await;
             let _ = this.update(cx, |this, cx| {
-                this.model.checking_updates = false;
+                this.model.update_check = None;
                 let message = match result {
                     Ok((library, 0)) => {
                         this.model.library = library;
-                        this.tr("所有技能都是最新版本", "All Skills are up to date")
+                        this.tr("所有技能都是最新版本", "All skills are up to date")
                             .to_string()
                     }
                     Ok((library, count)) => {
                         this.model.library = library;
                         if this.uses_english() {
-                            format!("{count} Skill(s) can be updated")
+                            format!("{} can be updated", counted(count, "skill", "skills"))
                         } else {
                             format!("发现 {count} 个可更新的技能")
                         }
                     }
-                    Err(error) => error.to_string(),
+                    Err(error) => this.error_message(error),
                 };
                 this.show_notice(message, cx);
                 this.refresh(cx);
@@ -155,7 +212,7 @@ impl KitterApp {
                         this.model.library = library;
                         this.tr("技能已更新", "Skill updated").to_string()
                     }
-                    Err(error) => error.to_string(),
+                    Err(error) => this.error_message(error),
                 };
                 this.show_notice(message, cx);
                 this.refresh(cx);
@@ -171,6 +228,12 @@ impl KitterApp {
         }
         if self.add_flow.task.is_some() || self.add_flow.selected.is_empty() {
             return;
+        }
+        if self.groups_flow.edit == Some(GroupEdit::Create) {
+            self.commit_group_edit(cx);
+            if self.groups_flow.edit.is_some() {
+                return;
+            }
         }
         let Some(scan) = self.add_flow.scan.take() else {
             return;
@@ -188,28 +251,49 @@ impl KitterApp {
                 .background_executor()
                 .spawn(async move {
                     let mut library = SkillLibrary::open_in(data_dir)?;
-                    let count =
+                    let summary =
                         scan.import_selected(&mut library, &selected, group_name.as_deref())?;
-                    Ok::<_, anyhow::Error>((library, count))
+                    Ok::<_, anyhow::Error>((library, summary))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.add_flow.task = None;
                 match result {
-                    Ok((library, count)) => {
+                    Ok((library, summary)) => {
                         this.model.library = library;
                         this.add_flow.selected.clear();
                         this.close_dialog(cx);
                         let message = if this.uses_english() {
-                            format!("Added {count} Skill(s)")
+                            match (summary.added, summary.skipped) {
+                                (0, skipped) => {
+                                    format!("No new skills added · {skipped} already added")
+                                }
+                                (added, 0) => {
+                                    format!("Added {}", counted(added, "skill", "skills"))
+                                }
+                                (added, skipped) => {
+                                    format!(
+                                        "Added {} · {skipped} already added",
+                                        counted(added, "skill", "skills")
+                                    )
+                                }
+                            }
                         } else {
-                            format!("已添加 {count} 个技能")
+                            match (summary.added, summary.skipped) {
+                                (0, skipped) => {
+                                    format!("没有新增技能，已跳过 {skipped} 个已添加技能")
+                                }
+                                (added, 0) => format!("已添加 {added} 个技能"),
+                                (added, skipped) => {
+                                    format!("已添加 {added} 个技能，跳过 {skipped} 个已添加技能")
+                                }
+                            }
                         };
                         this.show_notice(message, cx);
                         this.refresh(cx);
                     }
                     Err(error) => {
-                        this.add_flow.error = Some(error.to_string());
+                        this.add_flow.error = Some(this.error_message(error));
                         this.notify_dialog(cx);
                     }
                 }

@@ -1,8 +1,8 @@
 [package]
 name = "kitter"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2024"
-description = "Native Agent Skill manager"
+description = "A simple, lightweight skill manager built in Rust"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/what1f/kitter"
@@ -16,6 +16,7 @@ desktop = [
     "dep:gpui-component",
     "dep:gpui-base",
     "dep:gpui-component-assets",
+    "dep:fix-path-env",
 ]
 ui-test = ["desktop", "gpui/test-support"]
 
@@ -33,8 +34,10 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 sys-locale = "0.3.2"
 tempfile = "3.20"
+toml = "0.8"
 walkdir = "2.5"
 ignore = "0.4"
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.0"
