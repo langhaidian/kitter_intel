@@ -2981,13 +2981,27 @@ fn codex_plugin_roots(codex_home: &Path) -> Vec<SkillRoot> {
         .collect()
 }
 
-fn enabled_plugin_ids(config: &str) -> Vec<String> {
-    let Ok(config) = toml::from_str::<toml::Value>(config) else {
-        return Vec::new();
-    };
-    let Some(plugins) = config.get("plugins").and_then(toml::Value::as_table) else {
-        return Vec::new();
-    };
+fn extract_plugins_section(config: &str) -> String {
+    let mut in_plugins = false;
+    let mut result = String::new();
+    for raw_line in config.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("[plugins") || line.starts_with("[[plugins") {
+            in_plugins = true;
+            result.push_str(raw_line);
+            result.push('\n');
+        } else if line.starts_with('[') {
+            in_plugins = false;
+        } else if in_plugins {
+            result.push_str(raw_line);
+            result.push('\n');
+        }
+    }
+    result
+}
+
+fn parse_plugins_from_value(value: &toml::Value) -> Option<Vec<String>> {
+    let plugins = value.get("plugins").and_then(toml::Value::as_table)?;
     let mut enabled = plugins
         .iter()
         .filter(|(_, plugin)| {
@@ -3001,8 +3015,28 @@ fn enabled_plugin_ids(config: &str) -> Vec<String> {
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     enabled.sort();
-    enabled
+    Some(enabled)
 }
+
+fn enabled_plugin_ids(config: &str) -> Vec<String> {
+    if let Ok(value) = toml::from_str::<toml::Value>(config) {
+        if let Some(enabled) = parse_plugins_from_value(&value) {
+            return enabled;
+        }
+    }
+
+    let plugins_section = extract_plugins_section(config);
+    if !plugins_section.is_empty() {
+        if let Ok(value) = toml::from_str::<toml::Value>(&plugins_section) {
+            if let Some(enabled) = parse_plugins_from_value(&value) {
+                return enabled;
+            }
+        }
+    }
+
+    Vec::new()
+}
+
 
 fn codex_disabled_skills(codex_home: &Path, home: &Path) -> HashSet<PathBuf> {
     let Ok(config) = fs::read_to_string(codex_home.join("config.toml")) else {
@@ -3554,6 +3588,10 @@ mod tests {
              \"on@market\".enabled = true\n\
              \"off@market\".enabled = false\n";
         assert_eq!(enabled_plugin_ids(dotted_config), vec!["on@market"]);
+        let windows_path_config = "[plugins.\"on@market\"]\nenabled = true\n\
+             [plugins.\"off@market\"]\nenabled = false\n\
+             [[skills.config]]\npath = \"C:\\Users\\runneradmin\\AppData\\Local\\Temp\\demo\\SKILL.md\"\nenabled = false\n";
+        assert_eq!(enabled_plugin_ids(windows_path_config), vec!["on@market"]);
         assert!(enabled_plugin_ids("[plugins\ninvalid").is_empty());
         assert!(enabled_plugin_ids("[plugins]\ninvalid = true").is_empty());
         assert!(
